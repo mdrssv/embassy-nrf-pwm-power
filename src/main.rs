@@ -2,14 +2,19 @@
 #![no_std]
 #![no_main]
 
+use core::{cmp::min, ptr::{slice_from_raw_parts, slice_from_raw_parts_mut}};
+
 use cortex_m::peripheral::NVIC;
 use defmt::{debug, info, trace, unwrap};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::{
+    Peri, PeripheralType,
+    gpio::{Output, Pin},
     interrupt,
-    pac::{self, POWER},
-    pwm::{PWM_CLK_HZ, SimplePwm},
+    pac::{self, POWER, pwm::Pwm},
+    peripherals::PWM0,
+    pwm::{Instance, PWM_CLK_HZ, SimplePwm},
 };
 use embassy_time::Timer;
 use nrf_modem::{ConnectionPreference, MemoryLayout, SystemMode, send_at};
@@ -17,9 +22,27 @@ use panic_probe as _;
 
 extern crate tinyrlibc;
 
+fn dump_pwm_state<T: Instance>(_: &Peri<'static, T>, buf: &mut [u8]) {
+    // need to make this pub in embassy-nrf
+    //    let regs = T::regs();
+    let ptr = 0x50021000 as *const u8;
+    //  let ptr = regs.as_ptr() as *const u8;
+    trace!("reg block: {:#x}", ptr);
+    let reg_block = unsafe { &*slice_from_raw_parts(ptr, ptr.add(0x56C).offset_from(ptr) as _) };
+    info!("{=[u8]:b} ({})", reg_block, reg_block.len());
+    let reg_block = &reg_block[..min(reg_block.len(), buf.len())];
+    buf[..reg_block.len()].copy_from_slice(reg_block);
+}
+
+fn force_off() {
+    let ptr = 0x50021000 as *mut u8;
+    let reg_block = unsafe { &mut *slice_from_raw_parts_mut(ptr, ptr.add(0x56C).offset_from(ptr) as _) };
+    reg_block.fill(0u8);
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    let mut p = embassy_nrf::init(Default::default());
     POWER.tasks_constlat().write_value(0);
     POWER.tasks_lowpwr().write_value(1);
     // not initializing the modem uses more power
@@ -31,31 +54,62 @@ async fn main(_spawner: Spawner) {
     Timer::after_secs(10).await;
     if !cfg!(feature = "no-pwm") {
         info!("go");
-        let r = p.P0_15;
-        let g = p.P0_16;
-        let b = p.P0_17;
-        let mut pwm = SimplePwm::new_3ch(p.PWM0, r, g, b);
-        const MAX_DUTY: u16 = (PWM_CLK_HZ / 1_000) as _;
-        pwm.set_max_duty(MAX_DUTY);
-        pwm.set_prescaler(embassy_nrf::pwm::Prescaler::Div1);
-        pwm.set_ch0_drive(embassy_nrf::gpio::OutputDrive::Standard);
-        pwm.set_ch1_drive(embassy_nrf::gpio::OutputDrive::Standard);
-        pwm.set_ch2_drive(embassy_nrf::gpio::OutputDrive::Standard);
-        for ch in 0..2 {
-            pwm.set_duty(ch, 0);
+        let mut r = p.P0_15;
+        let mut g = p.P0_16;
+        let mut b = p.P0_17;
+        fn persist_low<T: Pin>(r: Peri<'static, T>) {
+            let mut o = Output::new(
+                r,
+                embassy_nrf::gpio::Level::Low,
+                embassy_nrf::gpio::OutputDrive::Standard,
+            );
+            o.set_low();
+            o.persist();
         }
-        for ch in 0..3 {
-            trace!("ch: {}", ch);
-            for duty in [0, MAX_DUTY, 0] {
-                pwm.set_duty(ch, duty);
-                Timer::after_millis(500).await;
+        unsafe {
+            persist_low(r.clone_unchecked());
+            persist_low(g.clone_unchecked());
+            persist_low(b.clone_unchecked());
+        }
+        let mut before = [0u8; 2048];
+        let mut after = [0u8; 2048];
+        dump_pwm_state(&p.PWM0, &mut before[..]);
+        {
+            let mut pwm = SimplePwm::new_3ch(p.PWM0.reborrow(), r, g, b);
+            const MAX_DUTY: u16 = (PWM_CLK_HZ / 1_000) as _;
+            pwm.set_max_duty(MAX_DUTY);
+            pwm.set_prescaler(embassy_nrf::pwm::Prescaler::Div1);
+            pwm.set_ch0_drive(embassy_nrf::gpio::OutputDrive::Standard);
+            pwm.set_ch1_drive(embassy_nrf::gpio::OutputDrive::Standard);
+            pwm.set_ch2_drive(embassy_nrf::gpio::OutputDrive::Standard);
+            for ch in 0..2 {
+                pwm.set_duty(ch, 0);
             }
+            dump_pwm_state(&unsafe { PWM0::steal() }, &mut after[..]);
+            for ch in 0..3 {
+                trace!("ch: {}", ch);
+                for duty in [0, MAX_DUTY, 0] {
+                    pwm.set_duty(ch, duty);
+                    Timer::after_millis(500).await;
+                }
+            }
+            for ch in 0..2 {
+                pwm.set_duty(ch, 0);
+            }
+            drop(pwm);
+            info!("drop");
         }
-        for ch in 0..2 {
-            pwm.set_duty(ch, 0);
+        dump_pwm_state(&p.PWM0, &mut after[..]);
+        let diff = before
+            .into_iter()
+            .zip(after.into_iter())
+            .enumerate()
+            .filter(|(_, (b, a))| *a != *b);
+        for (i, (b, a)) in diff {
+            info!("diff at {:#x} {:#08b} -> {:#08b}", i, b, a);
         }
-        drop(pwm);
-        info!("drop");
+        force_off();
+        dump_pwm_state(&p.PWM0, &mut after[..]);
     }
     info!("sleep");
     Timer::after_secs(1000).await;
